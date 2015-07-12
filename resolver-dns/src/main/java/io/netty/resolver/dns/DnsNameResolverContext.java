@@ -22,6 +22,7 @@ import io.netty.channel.AddressedEnvelope;
 import io.netty.channel.socket.InternetProtocolFamily;
 import io.netty.handler.codec.dns.DefaultDnsQuestion;
 import io.netty.handler.codec.dns.DefaultDnsRecordDecoder;
+import io.netty.handler.codec.dns.DnsResponseCode;
 import io.netty.handler.codec.dns.DnsSection;
 import io.netty.handler.codec.dns.DnsQuestion;
 import io.netty.handler.codec.dns.DnsRawRecord;
@@ -66,6 +67,7 @@ final class DnsNameResolverContext {
             };
 
     private final DnsNameResolver parent;
+    private final Iterator<InetSocketAddress> nameServerAddrs;
     private final Promise<InetSocketAddress> promise;
     private final String hostname;
     private final int port;
@@ -87,6 +89,7 @@ final class DnsNameResolverContext {
         this.hostname = hostname;
         this.port = port;
 
+        nameServerAddrs = parent.nameServerAddresses.iterator();
         maxAllowedQueries = parent.maxQueriesPerResolve();
         resolveAddressTypes = parent.resolveAddressTypesUnsafe();
         allowedQueries = maxAllowedQueries;
@@ -106,18 +109,18 @@ final class DnsNameResolverContext {
                 throw new Error();
             }
 
-            query(parent.nameServerAddresses, new DefaultDnsQuestion(hostname, type));
+            query(nameServerAddrs.next(), new DefaultDnsQuestion(hostname, type));
         }
     }
 
-    private void query(Iterable<InetSocketAddress> nameServerAddresses, final DnsQuestion question) {
+    private void query(InetSocketAddress nameServerAddr, final DnsQuestion question) {
         if (allowedQueries == 0 || promise.isCancelled()) {
             return;
         }
 
         allowedQueries --;
 
-        final Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> f = parent.query(nameServerAddresses, question);
+        final Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> f = parent.query(nameServerAddr, question);
         queriesInProgress.add(f);
 
         f.addListener(new FutureListener<AddressedEnvelope<DnsResponse, InetSocketAddress>>() {
@@ -133,7 +136,9 @@ final class DnsNameResolverContext {
                     if (future.isSuccess()) {
                         onResponse(question, future.getNow());
                     } else {
+                        // Server did not respond or I/O error occurred; try again.
                         addTrace(future.cause());
+                        query(nameServerAddrs.next(), question);
                     }
                 } finally {
                     tryToFinishResolve();
@@ -142,16 +147,30 @@ final class DnsNameResolverContext {
         });
     }
 
-    void onResponse(final DnsQuestion question, AddressedEnvelope<DnsResponse, InetSocketAddress> response) {
-        final DnsRecordType type = question.type();
+    void onResponse(final DnsQuestion question, AddressedEnvelope<DnsResponse, InetSocketAddress> envelope) {
         try {
-            if (type == DnsRecordType.A || type == DnsRecordType.AAAA) {
-                onResponseAorAAAA(type, question, response);
-            } else if (type == DnsRecordType.CNAME) {
-                onResponseCNAME(question, response);
+            final DnsResponse res = envelope.content();
+            final DnsResponseCode code = res.code();
+            if (code == DnsResponseCode.NOERROR) {
+                final DnsRecordType type = question.type();
+                if (type == DnsRecordType.A || type == DnsRecordType.AAAA) {
+                    onResponseAorAAAA(type, question, envelope);
+                } else if (type == DnsRecordType.CNAME) {
+                    onResponseCNAME(question, envelope);
+                }
+                return;
+            }
+
+            addTrace(envelope.sender(),
+                     "response code: " + code + " with " + res.count(DnsSection.ANSWER) + " answer(s) and " +
+                     res.count(DnsSection.AUTHORITY) + " authority resource(s)");
+
+            // Retry with the next server if the server did not tell us that the domain does not exist.
+            if (code != DnsResponseCode.NXDOMAIN) {
+                query(nameServerAddrs.next(), question);
             }
         } finally {
-            ReferenceCountUtil.safeRelease(response);
+            ReferenceCountUtil.safeRelease(envelope);
         }
     }
 
@@ -305,7 +324,7 @@ final class DnsNameResolverContext {
             if (!triedCNAME) {
                 // As the last resort, try to query CNAME, just in case the name server has it.
                 triedCNAME = true;
-                query(parent.nameServerAddresses, new DefaultDnsQuestion(hostname, DnsRecordType.CNAME));
+                query(nameServerAddrs.next(), new DefaultDnsQuestion(hostname, DnsRecordType.CNAME));
                 return;
             }
         }
@@ -481,8 +500,9 @@ final class DnsNameResolverContext {
         trace.append(" CNAME ");
         trace.append(cname);
 
-        query(parent.nameServerAddresses, new DefaultDnsQuestion(cname, DnsRecordType.A));
-        query(parent.nameServerAddresses, new DefaultDnsQuestion(cname, DnsRecordType.AAAA));
+        final InetSocketAddress nextAddr = nameServerAddrs.next();
+        query(nextAddr, new DefaultDnsQuestion(cname, DnsRecordType.A));
+        query(nextAddr, new DefaultDnsQuestion(cname, DnsRecordType.AAAA));
     }
 
     private void addTrace(InetSocketAddress nameServerAddr, String msg) {

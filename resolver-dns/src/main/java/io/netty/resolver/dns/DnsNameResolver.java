@@ -31,19 +31,15 @@ import io.netty.channel.socket.InternetProtocolFamily;
 import io.netty.handler.codec.dns.DatagramDnsQueryEncoder;
 import io.netty.handler.codec.dns.DatagramDnsResponse;
 import io.netty.handler.codec.dns.DatagramDnsResponseDecoder;
-import io.netty.handler.codec.dns.DnsSection;
 import io.netty.handler.codec.dns.DnsQuestion;
-import io.netty.handler.codec.dns.DnsRecord;
 import io.netty.handler.codec.dns.DnsResponse;
-import io.netty.handler.codec.dns.DnsResponseCode;
 import io.netty.resolver.NameResolver;
 import io.netty.resolver.SimpleNameResolver;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectHashMap;
+import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
-import io.netty.util.concurrent.ScheduledFuture;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -58,7 +54,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
@@ -104,6 +99,14 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
      */
     final ConcurrentMap<DnsQuestion, DnsCacheEntry> queryCache = PlatformDependent.newConcurrentHashMap();
 
+    private final FastThreadLocal<Iterator<InetSocketAddress>> nameServerAddrIterator =
+            new FastThreadLocal<Iterator<InetSocketAddress>>() {
+                @Override
+                protected Iterator<InetSocketAddress> initialValue() throws Exception {
+                    return nameServerAddresses.iterator();
+                }
+            };
+
     private final DnsResponseHandler responseHandler = new DnsResponseHandler();
 
     private volatile long queryTimeoutMillis = 5000;
@@ -112,11 +115,10 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
     private volatile int minTtl;
     private volatile int maxTtl = Integer.MAX_VALUE;
     private volatile int negativeTtl;
-    private volatile int maxTriesPerQuery = 2;
+    private volatile int maxQueriesPerResolve = 3;
 
     private volatile InternetProtocolFamily[] resolveAddressTypes = DEFAULT_RESOLVE_ADDRESS_TYPES;
     private volatile boolean recursionDesired = true;
-    private volatile int maxQueriesPerResolve = 8;
 
     private volatile int maxPayloadSize;
 
@@ -385,32 +387,6 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
     }
 
     /**
-     * Returns the maximum number of tries for each query. The default value is 2 times.
-     *
-     * @see #setMaxTriesPerQuery(int)
-     */
-    public int maxTriesPerQuery() {
-        return maxTriesPerQuery;
-    }
-
-    /**
-     * Sets the maximum number of tries for each query.
-     *
-     * @return {@code this}
-     *
-     * @see #maxTriesPerQuery()
-     */
-    public DnsNameResolver setMaxTriesPerQuery(int maxTriesPerQuery) {
-        if (maxTriesPerQuery < 1) {
-            throw new IllegalArgumentException("maxTries: " + maxTriesPerQuery + " (expected: > 0)");
-        }
-
-        this.maxTriesPerQuery = maxTriesPerQuery;
-
-        return this;
-    }
-
-    /**
      * Returns the list of the protocol families of the address resolved by {@link #resolve(SocketAddress)}
      * in the order of preference.
      * The default value depends on the value of the system property {@code "java.net.preferIPv6Addresses"}.
@@ -659,7 +635,7 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
      * Sends a DNS query with the specified question.
      */
     public Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> query(DnsQuestion question) {
-        return query(nameServerAddresses, question);
+        return query(nextNameServerAddress(), question);
     }
 
     /**
@@ -667,16 +643,20 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
      */
     public Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> query(
             DnsQuestion question, Promise<AddressedEnvelope<? extends DnsResponse, InetSocketAddress>> promise) {
-        return query(nameServerAddresses, question, promise);
+        return query(nextNameServerAddress(), question, promise);
+    }
+
+    private InetSocketAddress nextNameServerAddress() {
+        return nameServerAddrIterator.get().next();
     }
 
     /**
      * Sends a DNS query with the specified question using the specified name server list.
      */
     public Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> query(
-            Iterable<InetSocketAddress> nameServerAddresses, DnsQuestion question) {
-        if (nameServerAddresses == null) {
-            throw new NullPointerException("nameServerAddresses");
+            InetSocketAddress nameServerAddr, DnsQuestion question) {
+        if (nameServerAddr == null) {
+            throw new NullPointerException("nameServerAddr");
         }
         if (question == null) {
             throw new NullPointerException("question");
@@ -696,7 +676,7 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
             }
         }
         return query0(
-                nameServerAddresses, question,
+                nameServerAddr, question,
                 eventLoop.<AddressedEnvelope<? extends DnsResponse, InetSocketAddress>>newPromise());
     }
 
@@ -704,11 +684,11 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
      * Sends a DNS query with the specified question using the specified name server list.
      */
     public Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> query(
-            Iterable<InetSocketAddress> nameServerAddresses, DnsQuestion question,
+            InetSocketAddress nameServerAddr, DnsQuestion question,
             Promise<AddressedEnvelope<? extends DnsResponse, InetSocketAddress>> promise) {
 
-        if (nameServerAddresses == null) {
-            throw new NullPointerException("nameServerAddresses");
+        if (nameServerAddr == null) {
+            throw new NullPointerException("nameServerAddr");
         }
         if (question == null) {
             throw new NullPointerException("question");
@@ -730,67 +710,25 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
             }
         }
 
-        return query0(nameServerAddresses, question, promise);
+        return query0(nameServerAddr, question, promise);
     }
 
     private Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> query0(
-            Iterable<InetSocketAddress> nameServerAddresses, DnsQuestion question,
+            InetSocketAddress nameServerAddr, DnsQuestion question,
             Promise<AddressedEnvelope<? extends DnsResponse, InetSocketAddress>> promise) {
 
         final Promise<AddressedEnvelope<DnsResponse, InetSocketAddress>> castPromise = cast(promise);
         try {
-            new DnsQueryContext(this, nameServerAddresses, question, castPromise).query();
+            new DnsQueryContext(this, nameServerAddr, question, castPromise).query();
             return castPromise;
         } catch (Exception e) {
             return castPromise.setFailure(e);
         }
     }
 
-    void cacheSuccess(
-            DnsQuestion question, AddressedEnvelope<? extends DnsResponse, InetSocketAddress> res, long delaySeconds) {
-        cache(question, new DnsCacheEntry(res), delaySeconds);
-    }
-
-    void cacheFailure(DnsQuestion question, Throwable cause, long delaySeconds) {
-        cache(question, new DnsCacheEntry(cause), delaySeconds);
-    }
-
-    private void cache(final DnsQuestion question, DnsCacheEntry entry, long delaySeconds) {
-        DnsCacheEntry oldEntry = queryCache.put(question, entry);
-        if (oldEntry != null) {
-            oldEntry.release();
-        }
-
-        boolean scheduled = false;
-        try {
-            entry.scheduleExpiration(
-                    ch.eventLoop(),
-                    new OneTimeTask() {
-                        @Override
-                        public void run() {
-                            clearCache(question);
-                        }
-                    },
-                    delaySeconds, TimeUnit.SECONDS);
-            scheduled = true;
-        } finally {
-            if (!scheduled) {
-                // If failed to schedule the expiration task,
-                // remove the entry from the cache so that it does not leak.
-                clearCache(question);
-                entry.release();
-            }
-        }
-    }
-
     @SuppressWarnings("unchecked")
     private static Promise<AddressedEnvelope<DnsResponse, InetSocketAddress>> cast(Promise<?> promise) {
         return (Promise<AddressedEnvelope<DnsResponse, InetSocketAddress>>) promise;
-    }
-
-    @SuppressWarnings("unchecked")
-    private static AddressedEnvelope<DnsResponse, InetSocketAddress> cast(AddressedEnvelope<?, ?> envelope) {
-        return (AddressedEnvelope<DnsResponse, InetSocketAddress>) envelope;
     }
 
     private final class DnsResponseHandler extends ChannelInboundHandlerAdapter {
@@ -805,78 +743,22 @@ public class DnsNameResolver extends SimpleNameResolver<InetSocketAddress> {
                 }
 
                 final DnsQueryContext qCtx = promises.get(queryId);
-
                 if (qCtx == null) {
                     if (logger.isWarnEnabled()) {
-                        logger.warn("Received a DNS response with an unknown ID: {}", queryId);
+                        logger.warn("{} Received a DNS response with an unknown ID: {}", ch, queryId);
                     }
                     return;
                 }
 
-                if (res.count(DnsSection.QUESTION) != 1) {
-                    logger.warn("Received a DNS response with invalid number of questions: {}", res);
-                    return;
-                }
-
-                final DnsQuestion q = qCtx.question();
-                if (!q.equals(res.recordAt(DnsSection.QUESTION))) {
-                    logger.warn("Received a mismatching DNS response: {}", res);
-                    return;
-                }
-
-                // Cancel the timeout task.
-                final ScheduledFuture<?> timeoutFuture = qCtx.timeoutFuture();
-                if (timeoutFuture != null) {
-                    timeoutFuture.cancel(false);
-                }
-
-                if (res.code() == DnsResponseCode.NOERROR) {
-                    cache(q, res);
-                    promises.set(queryId, null);
-
-                    Promise<AddressedEnvelope<DnsResponse, InetSocketAddress>> qPromise = qCtx.promise();
-                    if (qPromise.setUncancellable()) {
-                        qPromise.setSuccess(cast(res.retain()));
-                    }
-                } else {
-                    qCtx.retry(res.sender(),
-                               "response code: " + res.code() +
-                               " with " + res.count(DnsSection.ANSWER) + " answer(s) and " +
-                               res.count(DnsSection.AUTHORITY) + " authority resource(s)");
-                }
+                qCtx.finish(res);
             } finally {
                 ReferenceCountUtil.safeRelease(msg);
             }
         }
 
-        private void cache(DnsQuestion question, AddressedEnvelope<? extends DnsResponse, InetSocketAddress> res) {
-            final int maxTtl = maxTtl();
-            if (maxTtl == 0) {
-                return;
-            }
-
-            long ttl = Long.MAX_VALUE;
-            // Find the smallest TTL value returned by the server.
-            final DnsResponse resc = res.content();
-            final int answerCount = resc.count(DnsSection.ANSWER);
-            for (int i = 0; i < answerCount; i ++) {
-                final DnsRecord r = resc.recordAt(DnsSection.ANSWER, i);
-                final long rTtl = r.timeToLive();
-                if (ttl > rTtl) {
-                    ttl = rTtl;
-                }
-            }
-
-            // Ensure that the found TTL is between minTtl and maxTtl.
-            ttl = Math.max(minTtl(), Math.min(maxTtl, ttl));
-
-            DnsNameResolver.this.cacheSuccess(question, res, ttl);
-        }
-
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-            logger.warn("Unexpected exception: ", cause);
+            logger.warn("{} Unexpected exception: ", ch, cause);
         }
     }
-
 }
